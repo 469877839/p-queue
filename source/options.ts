@@ -106,7 +106,38 @@ export type QueueAddOptions = {
 	Unique identifier for the promise function, used to update its priority before execution. If not specified, it is auto-assigned an incrementing BigInt starting from `1n`.
 	*/
 	id?: string;
-} & TaskOptions & TimeoutOptions;
+} & TaskOptions & TimeoutOptions & RetryOptions;
+
+export type RetryOptions = {
+	/**
+	How many times a failed task is retried before the `queue.add()` promise rejects. Only the last failure rejects the promise; intermediate failures are retried silently.
+
+	Each attempt (the initial run and every retry) is scheduled through the queue, so it waits for a free concurrency slot and consumes one `intervalCap` slot, exactly like a freshly added task.
+
+	While waiting between attempts, the task releases its concurrency slot so it does not block other queued tasks. Such tasks are tracked separately and still count as unfinished work for `onIdle()`.
+
+	`pause()` does not stop retry timers: when the delay elapses while paused, the next attempt is enqueued but only runs after `start()` is called. `clear()` cancels pending retries and rejects their promises with the last error.
+
+	@default 0
+	*/
+	readonly retries?: number;
+
+	/**
+	Delay in milliseconds before the next attempt, or a function that computes the delay from the 1-based retry attempt number (useful for linear or exponential backoff). Only used together with `retries`.
+
+	@default 0
+
+	@example
+	```
+	// Fixed delay of 200ms between attempts
+	await queue.add(task, {retries: 3, retryDelay: 200});
+
+	// Exponential backoff: 100ms, 200ms, 400ms, ...
+	await queue.add(task, {retries: 3, retryDelay: attempt => 100 * 2 ** (attempt - 1)});
+	```
+	*/
+	readonly retryDelay?: number | ((attempt: number) => number);
+};
 
 export type TaskOptions = {
 	/**

@@ -50,6 +50,14 @@ export default class PQueue<QueueType extends Queue<RunFunction, EnqueueOptionsT
 
 	#pending = 0;
 
+	/*
+	Tasks that failed an attempt and are waiting out their retry delay. They hold no concurrency slot during the wait, so they are not part of `#pending`; this separate counter keeps `onIdle()` and the `idle` event from resolving while retries are still in flight.
+	*/
+	#retrying = 0;
+
+	// Active retry waits, so `clear()` can cancel them and no timer is left dangling after a task is cancelled.
+	readonly #retryStates = new Set<{timer: NodeJS.Timeout; cancel: () => void}>();
+
 	// The `!` is needed because of https://github.com/microsoft/TypeScript/issues/32194
 	#concurrency!: number;
 
@@ -284,7 +292,7 @@ export default class PQueue<QueueType extends Queue<RunFunction, EnqueueOptionsT
 			this.#clearIntervalTimer();
 			this.emit('empty');
 
-			if (this.#pending === 0) {
+			if (this.#pending === 0 && this.#retrying === 0) {
 				// Clear timeout as well when completely idle
 				this.#clearTimeoutTimer();
 
@@ -451,9 +459,22 @@ export default class PQueue<QueueType extends Queue<RunFunction, EnqueueOptionsT
 			throw new TypeError(`Expected \`timeout\` to be a positive finite number, got \`${options.timeout}\` (${typeof options.timeout})`);
 		}
 
+		if (options.retries !== undefined && !(Number.isInteger(options.retries) && options.retries >= 0)) {
+			throw new TypeError(`Expected \`retries\` to be a non-negative integer, got \`${options.retries}\` (${typeof options.retries})`);
+		}
+
+		if (options.retryDelay !== undefined
+			&& !(typeof options.retryDelay === 'function'
+				|| (typeof options.retryDelay === 'number' && Number.isFinite(options.retryDelay) && options.retryDelay >= 0))) {
+			throw new TypeError(`Expected \`retryDelay\` to be a non-negative finite number or a function, got \`${String(options.retryDelay)}\` (${typeof options.retryDelay})`);
+		}
+
 		return new Promise((resolve, reject) => {
 			// Create a unique symbol for tracking this task
 			const taskSymbol = Symbol(`task-${options.id}`);
+
+			const retries = options.retries ?? 0;
+			let failedAttempts = 0;
 
 			let cleanupQueueAbortHandler = () => undefined;
 			const run = async () => {
@@ -511,8 +532,13 @@ export default class PQueue<QueueType extends Queue<RunFunction, EnqueueOptionsT
 					resolve(result);
 					this.emit('completed', result);
 				} catch (error: unknown) {
-					reject(error);
-					this.emit('error', error);
+					// An aborted task is cancelled, not failed — it is never retried.
+					if (failedAttempts < retries && !options.signal?.aborted) {
+						scheduleRetry(error);
+					} else {
+						reject(error);
+						this.emit('error', error);
+					}
 				} finally {
 					// Clean up abort event listener
 					if (eventListener) {
@@ -529,8 +555,6 @@ export default class PQueue<QueueType extends Queue<RunFunction, EnqueueOptionsT
 				}
 			};
 
-			this.#queue.enqueue(run, options);
-
 			const removeQueuedTask = () => {
 				if (this.#queue instanceof PriorityQueue) {
 					this.#queue.remove(run);
@@ -540,30 +564,85 @@ export default class PQueue<QueueType extends Queue<RunFunction, EnqueueOptionsT
 				this.#queue.remove?.(options.id!); // Intentionally best-effort: queued abort removal is only supported for queue classes that implement `.remove()`.
 			};
 
-			// Handle abort while task is waiting in the queue
-			if (options.signal) {
-				const {signal} = options;
+			// Enqueue the task and (re-)register the abort listener that applies while it waits in the queue. Used for the initial add and again for every retry, since each attempt goes through the queue like a freshly added task.
+			const enqueueRun = (): boolean => {
+				this.#queue.enqueue(run, options);
 
-				const queueAbortHandler = () => {
-					cleanupQueueAbortHandler();
-					removeQueuedTask();
-					reject(signal.reason);
+				// Handle abort while task is waiting in the queue
+				if (options.signal) {
+					const {signal} = options;
+
+					const queueAbortHandler = () => {
+						cleanupQueueAbortHandler();
+						removeQueuedTask();
+						reject(signal.reason);
+						this.#tryToStartAnother();
+						this.emit('next');
+					};
+
+					cleanupQueueAbortHandler = () => {
+						signal.removeEventListener('abort', queueAbortHandler);
+						this.#queueAbortListenerCleanupFunctions.delete(cleanupQueueAbortHandler);
+					};
+
+					if (signal.aborted) {
+						queueAbortHandler();
+						return false;
+					}
+
+					signal.addEventListener('abort', queueAbortHandler, {once: true});
+					this.#queueAbortListenerCleanupFunctions.add(cleanupQueueAbortHandler);
+				}
+
+				return true;
+			};
+
+			const scheduleRetry = (error: unknown) => {
+				failedAttempts++;
+
+				const {retryDelay = 0} = options;
+				const delay = Math.max(0, typeof retryDelay === 'function' ? retryDelay(failedAttempts) : retryDelay);
+
+				// Tracked separately from `#pending`: the failed attempt releases its concurrency slot (via the `finally` block in `run`), but the task is still unfinished work, so `onIdle()` must not resolve until it settles.
+				this.#retrying++;
+
+				const cleanup = () => {
+					clearTimeout(state.timer);
+					options.signal?.removeEventListener('abort', onAbort);
+					this.#retryStates.delete(state);
+					this.#retrying--;
+				};
+
+				// An abort that arrives during the retry wait rejects immediately instead of waiting for the next attempt.
+				const onAbort = () => {
+					cleanup();
+					reject(options.signal!.reason);
 					this.#tryToStartAnother();
 					this.emit('next');
 				};
 
-				cleanupQueueAbortHandler = () => {
-					signal.removeEventListener('abort', queueAbortHandler);
-					this.#queueAbortListenerCleanupFunctions.delete(cleanupQueueAbortHandler);
+				const state: {timer: NodeJS.Timeout; cancel: () => void} = {
+					timer: setTimeout(() => {
+						cleanup();
+						// The next attempt goes through the queue again: it waits for a free concurrency slot like any other task and consumes one `intervalCap` slot when dequeued.
+						enqueueRun();
+						this.#tryToStartAnother();
+					}, delay),
+					// Used by `clear()`: a cancelled retry rejects with the last error and leaves no timer behind.
+					cancel: () => {
+						cleanup();
+						reject(error);
+						this.#tryToStartAnother();
+						this.emit('next');
+					},
 				};
 
-				if (signal.aborted) {
-					queueAbortHandler();
-					return;
-				}
+				this.#retryStates.add(state);
+				options.signal?.addEventListener('abort', onAbort, {once: true});
+			};
 
-				signal.addEventListener('abort', queueAbortHandler, {once: true});
-				this.#queueAbortListenerCleanupFunctions.add(cleanupQueueAbortHandler);
+			if (!enqueueRun()) {
+				return;
 			}
 
 			this.emit('add');
@@ -611,6 +690,8 @@ export default class PQueue<QueueType extends Queue<RunFunction, EnqueueOptionsT
 
 	/**
 	Clear the queue.
+
+	Tasks waiting out a retry delay are cancelled too: their retry timers are removed and their `queue.add()` promises reject with the last error. Pausing works differently — `pause()` does not stop retry timers, but the re-enqueued attempt only runs after `start()` is called.
 	*/
 	clear(): void {
 		for (const cleanupQueueAbortHandler of this.#queueAbortListenerCleanupFunctions) {
@@ -618,6 +699,11 @@ export default class PQueue<QueueType extends Queue<RunFunction, EnqueueOptionsT
 		}
 
 		this.#queue = new this.#queueClass();
+
+		// Cancel tasks waiting to retry: their promises reject with the last error and no timer is left behind.
+		for (const retryState of this.#retryStates) {
+			retryState.cancel();
+		}
 
 		// Clear interval timer since queue is now empty (consistent with #tryToStartAnother)
 		this.#clearIntervalTimer();
@@ -635,7 +721,7 @@ export default class PQueue<QueueType extends Queue<RunFunction, EnqueueOptionsT
 		// Emit events so waiters (onEmpty, onIdle, onSizeLessThan) can resolve
 		this.emit('empty');
 
-		if (this.#pending === 0) {
+		if (this.#pending === 0 && this.#retrying === 0) {
 			this.#clearTimeoutTimer();
 			this.emit('idle');
 		}
@@ -679,11 +765,13 @@ export default class PQueue<QueueType extends Queue<RunFunction, EnqueueOptionsT
 	/**
 	The difference with `.onEmpty` is that `.onIdle` guarantees that all work from the queue has finished. `.onEmpty` merely signals that the queue is empty, but it could mean that some promises haven't completed yet.
 
-	@returns A promise that settles when the queue becomes empty, and all promises have completed; `queue.size === 0 && queue.pending === 0`.
+	Tasks waiting out a retry delay count as unfinished work, so this does not settle while retries are still in flight.
+
+	@returns A promise that settles when the queue becomes empty, and all promises have completed; `queue.size === 0 && queue.pending === 0` and no tasks are waiting to retry.
 	*/
 	async onIdle(): Promise<void> {
-		// Instantly resolve if none pending and if nothing else is queued
-		if (this.#pending === 0 && this.#queue.size === 0) {
+		// Instantly resolve if none pending, nothing else is queued, and no retries are waiting
+		if (this.#pending === 0 && this.#queue.size === 0 && this.#retrying === 0) {
 			return;
 		}
 
@@ -977,7 +1065,7 @@ export default class PQueue<QueueType extends Queue<RunFunction, EnqueueOptionsT
 
 export type {Queue} from './queue.js';
 export {default as PriorityQueue} from './priority-queue.js';
-export {type QueueAddOptions, type Options} from './options.js';
+export {type QueueAddOptions, type Options, type RetryOptions} from './options.js';
 
 /**
 Error thrown when a task times out.

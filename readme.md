@@ -198,6 +198,34 @@ Type `string`
 
 Unique identifier for the promise function, used to update its priority before execution. If not specified, it is auto-assigned an incrementing BigInt starting from `1n`.
 
+##### retries
+
+Type: `number` (non-negative integer)\
+Default: `0`
+
+How many times a failed task is retried before the `queue.add()` promise rejects. Only the last failure rejects the promise; intermediate failures are retried silently.
+
+Each attempt (the initial run and every retry) is scheduled through the queue, so it waits for a free concurrency slot and consumes one `intervalCap` slot, exactly like a freshly added task. While waiting between attempts, the task releases its concurrency slot so it does not block other queued tasks, but it still counts as unfinished work for `.onIdle()`.
+
+```js
+const queue = new PQueue({concurrency: 1});
+
+// Retry up to 3 times with a fixed 200ms delay between attempts
+await queue.add(() => fetchData(), {retries: 3, retryDelay: 200});
+
+// Retry with exponential backoff: 100ms, 200ms, 400ms
+await queue.add(() => fetchData(), {retries: 3, retryDelay: attempt => 100 * 2 ** (attempt - 1)});
+```
+
+##### retryDelay
+
+Type: `number | ((attempt: number) => number)`\
+Default: `0`
+
+Delay in milliseconds before the next attempt, or a function that computes the delay from the 1-based retry attempt number (useful for linear or exponential backoff). Only used together with `retries`.
+
+If a `signal` is provided and it aborts during the retry wait, the `queue.add()` promise rejects immediately instead of waiting for the next attempt. `pause()` does not stop retry timers: when the delay elapses while paused, the next attempt is enqueued but only runs after `start()` is called. `clear()` cancels pending retries and rejects their promises with the last error.
+
 ##### signal
 
 [`AbortSignal`](https://developer.mozilla.org/en-US/docs/Web/API/AbortSignal) for cancellation of the operation. When aborted, it will be removed from the queue and the `queue.add()` call will reject with an [error](https://developer.mozilla.org/en-US/docs/Web/API/AbortSignal/reason). If the operation is already running, the signal will need to be handled by the operation itself.
@@ -261,6 +289,8 @@ Can be called multiple times. Useful if you for example add additional items at 
 Returns a promise that settles when the queue becomes empty, and all promises have completed; `queue.size === 0 && queue.pending === 0`.
 
 The difference with `.onEmpty` is that `.onIdle` guarantees that all work from the queue has finished. `.onEmpty` merely signals that the queue is empty, but it could mean that some promises haven't completed yet.
+
+Tasks waiting out a retry delay count as unfinished work, so `.onIdle()` does not settle while retries are still in flight.
 
 > [!NOTE]
 > The promise returned by `.onIdle()` resolves **once** when the queue becomes idle. If you want to be notified every time the queue becomes idle, use the `idle` event instead: `queue.on('idle', () => {})`.
@@ -348,6 +378,8 @@ Note that this only limits the number of items waiting to start. There could sti
 #### .clear()
 
 Clear the queue.
+
+Tasks waiting out a retry delay are cancelled too: their retry timers are removed and their `.add()` promises reject with the last error.
 
 > [!WARNING]
 > Any promises returned by `.add()` for tasks that were waiting in the queue (not yet running) will **never settle** after calling `.clear()`. This can cause "unsettled top-level await" warnings or hang your process. If you need the promises to settle, use `AbortSignal` for cancellation instead — aborting rejects the `.add()` promise cleanly.
