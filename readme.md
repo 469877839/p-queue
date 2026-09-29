@@ -233,6 +233,46 @@ try {
 }
 ```
 
+##### retries
+
+Type: `number` (non-negative integer)\
+Default: `0`
+
+The maximum number of times a failed task is retried before the promise returned by `.add()` rejects. The initial attempt is not counted, so `retries: 2` allows up to 3 executions. Only the final failure rejects the promise; tasks without this option behave exactly as before.
+
+Each attempt (including retries) is scheduled through the queue again, so it consumes a fresh `intervalCap` slot and waits for a free concurrency slot. Between attempts the task does *not* occupy a concurrency slot — a `concurrency: 1` queue keeps draining other tasks while a task waits to retry.
+
+```js
+const queue = new PQueue({concurrency: 1});
+
+// Try up to 3 times in total, waiting 200ms between attempts.
+await queue.add(() => fetchData(), {retries: 2, retryDelay: 200});
+```
+
+##### retryDelay
+
+Type: `number | (attempt: number) => number`\
+Default: `0`
+
+The delay in milliseconds between a failed attempt and the next retry. Pass a function to compute the delay from the 1-based retry number, for delays that grow per attempt (for example, linear or exponential backoff).
+
+```js
+const queue = new PQueue();
+
+// Exponential backoff: 100ms, 200ms, 400ms, ...
+await queue.add(() => fetchData(), {
+	retries: 3,
+	retryDelay: attempt => 100 * (2 ** (attempt - 1)),
+});
+```
+
+Behavior of retry waits:
+
+- An abort via `signal` during the wait rejects the promise immediately; it does not wait for the next attempt.
+- `.pause()` does not cancel the wait. The task re-enqueues when the delay elapses and starts once the queue is resumed.
+- `.clear()` cancels the wait and drops the task. Like queued tasks, its promise never settles.
+- `.onIdle()` treats a task waiting between retries as unfinished work and does not settle until the last retry completes.
+
 #### .addAll(fns, options?)
 
 Same as `.add()`, but accepts an array of sync or async functions and returns a promise that resolves when all functions are resolved.
@@ -259,6 +299,8 @@ Can be called multiple times. Useful if you for example add additional items at 
 #### .onIdle()
 
 Returns a promise that settles when the queue becomes empty, and all promises have completed; `queue.size === 0 && queue.pending === 0`.
+
+Tasks waiting between retry attempts count as unfinished work, so this does not settle while a retry wait is still outstanding.
 
 The difference with `.onEmpty` is that `.onIdle` guarantees that all work from the queue has finished. `.onEmpty` merely signals that the queue is empty, but it could mean that some promises haven't completed yet.
 
@@ -348,6 +390,8 @@ Note that this only limits the number of items waiting to start. There could sti
 #### .clear()
 
 Clear the queue.
+
+Tasks waiting between retry attempts are also dropped and their wait timers are cancelled.
 
 > [!WARNING]
 > Any promises returned by `.add()` for tasks that were waiting in the queue (not yet running) will **never settle** after calling `.clear()`. This can cause "unsettled top-level await" warnings or hang your process. If you need the promises to settle, use `AbortSignal` for cancellation instead — aborting rejects the `.add()` promise cleanly.

@@ -50,6 +50,14 @@ export default class PQueue<QueueType extends Queue<RunFunction, EnqueueOptionsT
 
 	#pending = 0;
 
+	/*
+	Number of tasks currently waiting between retry attempts. Tracked separately from `#pending` because a waiting task has released its concurrency slot (so `#pending` must not count it), yet the queue is not idle while any retry wait is still outstanding. `onIdle()` and the `idle` event therefore check this counter in addition to `#pending` and the queue size.
+	*/
+	#retryWaitCount = 0;
+
+	// Cleanup functions that cancel the retry-wait timer of each waiting task, so `clear()` can drop them without leaving timers behind.
+	readonly #retryWaitCleanupFunctions = new Set<() => void>();
+
 	// The `!` is needed because of https://github.com/microsoft/TypeScript/issues/32194
 	#concurrency!: number;
 
@@ -284,7 +292,7 @@ export default class PQueue<QueueType extends Queue<RunFunction, EnqueueOptionsT
 			this.#clearIntervalTimer();
 			this.emit('empty');
 
-			if (this.#pending === 0) {
+			if (this.#pending === 0 && this.#retryWaitCount === 0) {
 				// Clear timeout as well when completely idle
 				this.#clearTimeoutTimer();
 
@@ -326,6 +334,13 @@ export default class PQueue<QueueType extends Queue<RunFunction, EnqueueOptionsT
 		}
 
 		return taskStarted;
+	}
+
+	// Emit `idle` when nothing is running, queued, or waiting between retries. Used when a retry wait ends without re-enqueueing (abort or `clear()`), since `#tryToStartAnother` is not reached on those paths.
+	#emitIdleIfIdle(): void {
+		if (this.#pending === 0 && this.#queue.size === 0 && this.#retryWaitCount === 0) {
+			this.emit('idle');
+		}
 	}
 
 	#initializeIntervalIfNeeded(): void {
@@ -451,14 +466,32 @@ export default class PQueue<QueueType extends Queue<RunFunction, EnqueueOptionsT
 			throw new TypeError(`Expected \`timeout\` to be a positive finite number, got \`${options.timeout}\` (${typeof options.timeout})`);
 		}
 
+		// Explicit annotations: `EnqueueOptionsType` is generic, so indexed-access types from it cannot be narrowed by `typeof` checks in closures below.
+		const retries: number = options.retries ?? 0;
+
+		if (!(Number.isInteger(retries) && retries >= 0)) {
+			throw new TypeError(`Expected \`retries\` to be a non-negative integer, got \`${options.retries}\` (${typeof options.retries})`);
+		}
+
+		const retryDelay: number | ((attempt: number) => number) = options.retryDelay ?? 0;
+
+		if (!(typeof retryDelay === 'function' || (Number.isFinite(retryDelay) && retryDelay >= 0))) {
+			throw new TypeError(`Expected \`retryDelay\` to be a non-negative finite number or a function, got \`${retryDelay}\` (${typeof retryDelay})`);
+		}
+
 		return new Promise((resolve, reject) => {
 			// Create a unique symbol for tracking this task
 			const taskSymbol = Symbol(`task-${options.id}`);
+
+			// 1-based number of the current execution. Incremented on every dequeue.
+			let attempt = 0;
 
 			let cleanupQueueAbortHandler = () => undefined;
 			const run = async () => {
 				// Task is now running — remove the queued-state abort listener
 				cleanupQueueAbortHandler();
+
+				attempt++;
 
 				this.#pending++;
 
@@ -511,8 +544,13 @@ export default class PQueue<QueueType extends Queue<RunFunction, EnqueueOptionsT
 					resolve(result);
 					this.emit('completed', result);
 				} catch (error: unknown) {
-					reject(error);
-					this.emit('error', error);
+					// Retry instead of rejecting when attempts remain. The abort check ensures an abort that raced the failure rejects immediately instead of scheduling another attempt.
+					if (attempt <= retries && !options.signal?.aborted) {
+						scheduleRetry();
+					} else {
+						reject(error);
+						this.emit('error', error);
+					}
 				} finally {
 					// Clean up abort event listener
 					if (eventListener) {
@@ -529,8 +567,6 @@ export default class PQueue<QueueType extends Queue<RunFunction, EnqueueOptionsT
 				}
 			};
 
-			this.#queue.enqueue(run, options);
-
 			const removeQueuedTask = () => {
 				if (this.#queue instanceof PriorityQueue) {
 					this.#queue.remove(run);
@@ -540,31 +576,74 @@ export default class PQueue<QueueType extends Queue<RunFunction, EnqueueOptionsT
 				this.#queue.remove?.(options.id!); // Intentionally best-effort: queued abort removal is only supported for queue classes that implement `.remove()`.
 			};
 
-			// Handle abort while task is waiting in the queue
-			if (options.signal) {
-				const {signal} = options;
+			const enqueueTask = () => {
+				this.#queue.enqueue(run, options);
 
-				const queueAbortHandler = () => {
-					cleanupQueueAbortHandler();
-					removeQueuedTask();
-					reject(signal.reason);
-					this.#tryToStartAnother();
-					this.emit('next');
-				};
+				// Handle abort while task is waiting in the queue
+				if (options.signal) {
+					const {signal} = options;
 
-				cleanupQueueAbortHandler = () => {
-					signal.removeEventListener('abort', queueAbortHandler);
-					this.#queueAbortListenerCleanupFunctions.delete(cleanupQueueAbortHandler);
-				};
+					const queueAbortHandler = () => {
+						cleanupQueueAbortHandler();
+						removeQueuedTask();
+						reject(signal.reason);
+						this.#tryToStartAnother();
+						this.emit('next');
+					};
 
-				if (signal.aborted) {
-					queueAbortHandler();
-					return;
+					cleanupQueueAbortHandler = () => {
+						signal.removeEventListener('abort', queueAbortHandler);
+						this.#queueAbortListenerCleanupFunctions.delete(cleanupQueueAbortHandler);
+					};
+
+					if (signal.aborted) {
+						queueAbortHandler();
+						return;
+					}
+
+					signal.addEventListener('abort', queueAbortHandler, {once: true});
+					this.#queueAbortListenerCleanupFunctions.add(cleanupQueueAbortHandler);
 				}
+			};
 
-				signal.addEventListener('abort', queueAbortHandler, {once: true});
-				this.#queueAbortListenerCleanupFunctions.add(cleanupQueueAbortHandler);
-			}
+			/*
+			Wait between a failed attempt and the next one. The failed attempt's `finally` block has already scheduled `#next()`, which releases the concurrency slot, so the wait never blocks other tasks — a `concurrency: 1` queue keeps draining while a task waits to retry. The task is re-enqueued afterwards, which means the next attempt goes through `#tryToStartAnother` again and consumes a fresh `intervalCap` slot like any other execution.
+
+			While waiting:
+			- An abort rejects the promise immediately and cancels the timer.
+			- `pause()` does not cancel the wait; the task re-enqueues when the delay elapses and starts once the queue is resumed.
+			- `clear()` cancels the wait (see `clear()`); the promise then never settles, matching how `clear()` treats queued tasks.
+			*/
+			const scheduleRetry = () => {
+				this.#retryWaitCount++;
+
+				const computedDelay = typeof retryDelay === 'function' ? retryDelay(attempt) : retryDelay;
+				const delay = Number.isFinite(computedDelay) && computedDelay > 0 ? computedDelay : 0;
+
+				const cleanup = () => {
+					clearTimeout(timer);
+					options.signal?.removeEventListener('abort', onAbortDuringWait);
+					this.#retryWaitCleanupFunctions.delete(cleanup);
+					this.#retryWaitCount--;
+				};
+
+				const onAbortDuringWait = () => {
+					cleanup();
+					reject(options.signal!.reason);
+					this.#emitIdleIfIdle();
+				};
+
+				const timer = setTimeout(() => {
+					cleanup();
+					enqueueTask();
+					this.#tryToStartAnother();
+				}, delay);
+
+				options.signal?.addEventListener('abort', onAbortDuringWait, {once: true});
+				this.#retryWaitCleanupFunctions.add(cleanup);
+			};
+
+			enqueueTask();
 
 			this.emit('add');
 
@@ -611,10 +690,17 @@ export default class PQueue<QueueType extends Queue<RunFunction, EnqueueOptionsT
 
 	/**
 	Clear the queue.
+
+	Tasks waiting between retry attempts are also dropped: their wait timers are cancelled and, like queued tasks, their promises never settle.
 	*/
 	clear(): void {
 		for (const cleanupQueueAbortHandler of this.#queueAbortListenerCleanupFunctions) {
 			cleanupQueueAbortHandler();
+		}
+
+		// Cancel pending retry waits so their timers do not linger after the tasks are dropped.
+		for (const cleanupRetryWait of this.#retryWaitCleanupFunctions) {
+			cleanupRetryWait();
 		}
 
 		this.#queue = new this.#queueClass();
@@ -635,7 +721,7 @@ export default class PQueue<QueueType extends Queue<RunFunction, EnqueueOptionsT
 		// Emit events so waiters (onEmpty, onIdle, onSizeLessThan) can resolve
 		this.emit('empty');
 
-		if (this.#pending === 0) {
+		if (this.#pending === 0 && this.#retryWaitCount === 0) {
 			this.#clearTimeoutTimer();
 			this.emit('idle');
 		}
@@ -679,11 +765,13 @@ export default class PQueue<QueueType extends Queue<RunFunction, EnqueueOptionsT
 	/**
 	The difference with `.onEmpty` is that `.onIdle` guarantees that all work from the queue has finished. `.onEmpty` merely signals that the queue is empty, but it could mean that some promises haven't completed yet.
 
-	@returns A promise that settles when the queue becomes empty, and all promises have completed; `queue.size === 0 && queue.pending === 0`.
+	Tasks waiting between retry attempts count as unfinished work, so this does not settle while a retry wait is still outstanding.
+
+	@returns A promise that settles when the queue becomes empty, and all promises have completed; `queue.size === 0 && queue.pending === 0` and no task is waiting between retry attempts.
 	*/
 	async onIdle(): Promise<void> {
-		// Instantly resolve if none pending and if nothing else is queued
-		if (this.#pending === 0 && this.#queue.size === 0) {
+		// Instantly resolve if none pending, nothing else is queued, and no retry wait is outstanding
+		if (this.#pending === 0 && this.#queue.size === 0 && this.#retryWaitCount === 0) {
 			return;
 		}
 
@@ -807,6 +895,8 @@ export default class PQueue<QueueType extends Queue<RunFunction, EnqueueOptionsT
 
 	/**
 	Number of running items (no longer in the queue).
+
+	Tasks waiting between retry attempts are not counted, as they do not occupy a concurrency slot while waiting.
 	*/
 	get pending(): number {
 		return this.#pending;
@@ -977,7 +1067,7 @@ export default class PQueue<QueueType extends Queue<RunFunction, EnqueueOptionsT
 
 export type {Queue} from './queue.js';
 export {default as PriorityQueue} from './priority-queue.js';
-export {type QueueAddOptions, type Options} from './options.js';
+export {type QueueAddOptions, type Options, type RetryOptions} from './options.js';
 
 /**
 Error thrown when a task times out.

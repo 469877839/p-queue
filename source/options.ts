@@ -106,7 +106,44 @@ export type QueueAddOptions = {
 	Unique identifier for the promise function, used to update its priority before execution. If not specified, it is auto-assigned an incrementing BigInt starting from `1n`.
 	*/
 	id?: string;
-} & TaskOptions & TimeoutOptions;
+} & TaskOptions & TimeoutOptions & RetryOptions;
+
+export type RetryOptions = {
+	/**
+	The maximum number of times a failed task is retried before the promise returned by `.add()` rejects. The initial attempt is not counted, so `retries: 2` allows up to 3 executions.
+
+	Each attempt (including retries) is scheduled through the queue again: it consumes a fresh `intervalCap` slot and waits for a free concurrency slot. Between attempts the task does *not* occupy a concurrency slot, so other queued tasks can run while it waits.
+
+	@default 0
+
+	@example
+	```
+	const queue = new PQueue({concurrency: 1});
+
+	// Try up to 3 times in total, waiting 200ms between attempts.
+	await queue.add(() => fetchData(), {retries: 2, retryDelay: 200});
+	```
+	*/
+	readonly retries?: number;
+
+	/**
+	The delay in milliseconds between a failed attempt and the next retry, or a function that receives the 1-based retry number and returns the delay. Use a function for delays that grow per attempt (for example, linear or exponential backoff).
+
+	@default 0
+
+	@example
+	```
+	const queue = new PQueue();
+
+	// Exponential backoff: 100ms, 200ms, 400ms, ...
+	await queue.add(() => fetchData(), {
+		retries: 3,
+		retryDelay: attempt => 100 * (2 ** (attempt - 1)),
+	});
+	```
+	*/
+	readonly retryDelay?: number | ((attempt: number) => number);
+};
 
 export type TaskOptions = {
 	/**
